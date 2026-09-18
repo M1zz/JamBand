@@ -13,7 +13,9 @@ struct LobbyView: View {
                     instrumentGrid
                     playerList
                     readyButton
-                    Text("모든 플레이어가 준비되면 3초 후 자동으로 시작됩니다.")
+                    Text(state.demoMode
+                         ? "데모 모드: 가상 밴드가 나머지 파트를 맡아 이 기기 한 대로 전체 합주를 들려줍니다."
+                         : "모든 플레이어가 준비되면 3초 후 자동으로 시작됩니다.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -21,6 +23,18 @@ struct LobbyView: View {
                 .padding()
             }
             .navigationTitle("JamBand")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        state.demoMode ? state.stopDemo() : state.startDemo()
+                    } label: {
+                        Label(state.demoMode ? "데모 종료" : "데모",
+                              systemImage: state.demoMode ? "xmark.circle" : "play.circle")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .disabled(!state.demoMode && !state.canStartDemo)
+                }
+            }
         }
     }
 
@@ -30,7 +44,10 @@ struct LobbyView: View {
         HStack {
             Label("\(state.participantCount)명 접속", systemImage: "person.2.fill")
             Spacer()
-            if state.isLeader {
+            if state.demoMode {
+                Label("데모 모드", systemImage: "sparkles")
+                    .foregroundStyle(.purple)
+            } else if state.isLeader {
                 Label("리더", systemImage: "crown.fill")
                     .foregroundStyle(.yellow)
             } else if state.clockSynced {

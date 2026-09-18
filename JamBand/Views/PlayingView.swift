@@ -42,7 +42,9 @@ struct PlayingView: View {
                     }
                 }
 
-                Text(beat < 0 ? "곧 시작합니다…" : "\(state.participantCount)명 합주 중 · \(Int(state.song.bpm)) BPM")
+                Text(beat < 0 ? "곧 시작합니다…"
+                     : state.demoMode ? "데모 · 가상 밴드 \(state.demoPeers.count)명과 합주 중 · \(Int(state.song.bpm)) BPM"
+                     : "\(state.participantCount)명 합주 중 · \(Int(state.song.bpm)) BPM")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
 

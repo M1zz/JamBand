@@ -5,7 +5,7 @@ enum SynthError: Error {
     case unsupportedFormat
 }
 
-/// Plays exactly one part of a `Song`, scheduled against the shared host clock.
+/// Plays one part of a `Song` (or several, in demo mode), scheduled against the shared host clock.
 ///
 /// The sequencer lives inside the render callback: on every buffer it converts
 /// the buffer's host timestamp into a beat position and triggers any notes that
@@ -18,7 +18,7 @@ final class SynthEngine {
         var playing = false
         var startTime: Double = 0    // host seconds when beat 0 plays
         var bpm: Double = 120
-        var partIndex: Int = -1
+        var partMask: UInt32 = 0     // bit i set => play song.parts[i]
         var previewPart: Int = -1    // one-shot request consumed by the render thread
         var killAll = false          // one-shot: release every voice
     }
@@ -29,7 +29,7 @@ final class SynthEngine {
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
     private let transport = OSAllocatedUnfairLock(initialState: Transport())
-    private var voices = [Voice](repeating: Voice(), count: 24)
+    private var voices = [Voice](repeating: Voice(), count: 64)
     private let scratchCapacity = 8192
     private let scratch: UnsafeMutablePointer<Float>
     private var noteCounter = 0
@@ -94,7 +94,15 @@ final class SynthEngine {
     // MARK: - Control (main thread)
 
     func setPart(_ index: Int) {
-        transport.withLock { $0.partIndex = index }
+        setParts([index])
+    }
+
+    /// Plays several parts at once. Used by demo mode to fill in the virtual band.
+    func setParts(_ indices: [Int]) {
+        let mask = indices.reduce(UInt32(0)) { mask, i in
+            (0..<32).contains(i) ? mask | (1 << UInt32(i)) : mask
+        }
+        transport.withLock { $0.partMask = mask }
     }
 
     /// Plays the notes that sit on beat 0 of a part, so the lobby can audition it.
@@ -157,9 +165,7 @@ final class SynthEngine {
             }
         }
 
-        if t.playing, t.partIndex >= 0, t.partIndex < song.parts.count {
-            let part = song.parts[t.partIndex]
-
+        if t.playing, t.partMask != 0 {
             // When will the first frame of this buffer reach the speaker?
             var hostSeconds: Double
             if timestamp.pointee.mFlags.contains(.hostTimeValid) {
@@ -177,14 +183,16 @@ final class SynthEngine {
                 let loop = song.loopBeats
                 let kStart = max(0, Int(floor(beatStart / loop)))
                 let kEnd = Int(floor(beatEnd / loop))
-                for k in kStart...kEnd {
-                    let base = Double(k) * loop
-                    for note in part.notes {
-                        let b = base + note.beat
-                        if b < beatStart { continue }
-                        if b >= beatEnd { break }
-                        let delay = Int((b - beatStart) * secPerBeat * sampleRate)
-                        trigger(note, part: part, delay: min(max(delay, 0), frames - 1), bpm: t.bpm, sr: sr)
+                for (index, part) in song.parts.enumerated() where index < 32 && t.partMask & (1 << UInt32(index)) != 0 {
+                    for k in kStart...kEnd {
+                        let base = Double(k) * loop
+                        for note in part.notes {
+                            let b = base + note.beat
+                            if b < beatStart { continue }
+                            if b >= beatEnd { break }
+                            let delay = Int((b - beatStart) * secPerBeat * sampleRate)
+                            trigger(note, part: part, delay: min(max(delay, 0), frames - 1), bpm: t.bpm, sr: sr)
+                        }
                     }
                 }
             }

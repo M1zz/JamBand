@@ -13,6 +13,11 @@ import UIKit
 /// - When everyone is ready, the leader picks `now + 3s` on its own clock and
 ///   broadcasts it. Followers convert to local time with their offset and hand
 ///   the result to the synth, which schedules sample-accurately from there.
+///
+/// Demo mode lets a single device show off the whole band: virtual players
+/// take every instrument the user didn't pick, ready up one by one, and the
+/// synth plays all of their parts locally. It only runs while no real peer is
+/// connected and turns itself off as soon as one appears.
 @Observable
 final class AppState {
     enum Phase: Equatable { case lobby, countdown, playing }
@@ -36,6 +41,8 @@ final class AppState {
     private(set) var clockSynced = false
     private(set) var lastRTT: Double = 0
     private(set) var audioError: String?
+    private(set) var demoMode = false
+    private(set) var demoPeers: [PeerState] = []
 
     private let session: SessionManager
     private let synth: SynthEngine
@@ -43,6 +50,7 @@ final class AppState {
     @ObservationIgnored private var syncTask: Task<Void, Never>?
     @ObservationIgnored private var started = false
     @ObservationIgnored private var lastLeader = ""
+    @ObservationIgnored private var demoTask: Task<Void, Never>?
 
     init() {
         let song = Song.demo()
@@ -64,14 +72,20 @@ final class AppState {
         session.onMessage = { [weak self] message, peer, receivedAt in
             Task { @MainActor in self?.handle(message, from: peer, receivedAt: receivedAt) }
         }
+
+        // `-DemoMode` launch argument (Xcode scheme) starts straight into demo mode.
+        if ProcessInfo.processInfo.arguments.contains("-DemoMode") {
+            startDemo()
+        }
     }
 
     // MARK: - Derived state
 
     var leaderName: String { ([me.name] + Array(peers.keys)).min() ?? me.name }
     var isLeader: Bool { leaderName == me.name }
-    var participantCount: Int { peers.count + 1 }
-    var participants: [PeerState] { [me] + peers.values.sorted { $0.name < $1.name } }
+    var participantCount: Int { participants.count }
+    var participants: [PeerState] { [me] + peers.values.sorted { $0.name < $1.name } + demoPeers }
+    var canStartDemo: Bool { peers.isEmpty && phase == .lobby }
     var canReady: Bool { me.instrument != nil && (isLeader || clockSynced) }
 
     var myInstrument: Instrument? {
@@ -121,6 +135,7 @@ final class AppState {
         synth.setPart(id)
         synth.preview(part: id)
         session.send(.state(me))
+        if demoMode { refreshDemoPeers() }
     }
 
     func toggleReady() {
@@ -137,13 +152,57 @@ final class AppState {
         setIdleTimerDisabled(false)
         me.ready = false
         for key in peers.keys { peers[key]?.ready = false }
+        for i in demoPeers.indices { demoPeers[i].ready = false }
         if broadcast { session.send(.stop) }
         session.send(.state(me))
+    }
+
+    // MARK: - Demo mode
+
+    func startDemo() {
+        guard canStartDemo, !demoMode else { return }
+        demoMode = true
+        refreshDemoPeers()
+
+        // Virtual players ready up one at a time so the lobby visibly fills in.
+        demoTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(700))
+                guard let self, self.demoMode else { return }
+                if self.phase == .lobby, let i = self.demoPeers.firstIndex(where: { !$0.ready }) {
+                    self.demoPeers[i].ready = true
+                    self.checkAutoStart()
+                }
+            }
+        }
+    }
+
+    func stopDemo() {
+        guard demoMode else { return }
+        if phase != .lobby { stopPlayback(broadcast: false) }
+        demoTask?.cancel()
+        demoTask = nil
+        demoMode = false
+        demoPeers = []
+        me.ready = false
+        if let id = me.instrument { synth.setPart(id) }
+    }
+
+    /// One virtual player per instrument the user hasn't taken. Keeps the ready
+    /// state of players that stay on the same instrument.
+    private func refreshDemoPeers() {
+        let previous = Dictionary(uniqueKeysWithValues: demoPeers.map { ($0.instrument ?? -1, $0) })
+        demoPeers = instruments
+            .filter { $0.id != me.instrument }
+            .map { previous[$0.id] ?? PeerState(name: "🤖 \($0.name) 봇", instrument: $0.id, ready: false) }
     }
 
     // MARK: - Network events
 
     private func peersChanged(_ connected: [MCPeerID]) {
+        // A real player showed up: hand the stage back to the network session.
+        if demoMode && !connected.isEmpty { stopDemo() }
+
         var updated: [String: PeerState] = [:]
         var newcomers: [MCPeerID] = []
         for peer in connected {
@@ -221,6 +280,7 @@ final class AppState {
     private func checkAutoStart() {
         guard isLeader, phase == .lobby, me.ready, me.instrument != nil else { return }
         guard peers.values.allSatisfy({ $0.ready && $0.instrument != nil }) else { return }
+        guard demoPeers.allSatisfy(\.ready) else { return }
 
         let start = Clock.now() + 3.0
         session.send(.start(leaderTime: start, bpm: song.bpm))
@@ -229,6 +289,7 @@ final class AppState {
 
     private func beginPlayback(localStart: Double, bpm: Double) {
         startTime = localStart
+        synth.setParts(([me] + demoPeers).compactMap(\.instrument))
         synth.play(at: localStart, bpm: bpm)
         setIdleTimerDisabled(true)
 
